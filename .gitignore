@@ -7,6 +7,7 @@ indexes/
 tmp/
 retrieval/
 data/browsecomp_plus_decrypted.jsonl
+data/browsecomp_plus_corpus.jsonl
 topics-qrels/queries.tsv
 runs/
 evals/
