@@ -2,11 +2,17 @@
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
 
 from .base import BaseSearcher
+
+# Load PARADIGM_* from the repo-root .env on import, before parse_args reads the
+# env-var defaults below. Existing environment variables take precedence.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 logger = logging.getLogger(__name__)
 
