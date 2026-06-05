@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,13 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 logger = logging.getLogger(__name__)
 
 PARADIGM_MAX_RESULTS = 50
+
+# Retry tuning. 429 (rate limited) is retried indefinitely until it succeeds;
+# connection errors and 5xx are retried a bounded number of times. Backoff is
+# capped exponential, honoring a Retry-After header when the server sends one.
+PARADIGM_MAX_RETRIES = 5
+PARADIGM_BACKOFF_BASE = 1.0
+PARADIGM_BACKOFF_MAX = 60.0
 
 
 class ParadigmSearcher(BaseSearcher):
@@ -87,6 +95,66 @@ class ParadigmSearcher(BaseSearcher):
             self.skip_rerank,
         )
 
+    @staticmethod
+    def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
+        """Seconds to wait before retrying: Retry-After header if present, else capped backoff."""
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), PARADIGM_BACKOFF_MAX)
+            except ValueError:
+                pass
+        return min(PARADIGM_BACKOFF_BASE * (2 ** attempt), PARADIGM_BACKOFF_MAX)
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Issue an HTTP request with retries.
+
+        429 responses are retried indefinitely (until the request passes). Connection
+        errors and 5xx responses are retried up to PARADIGM_MAX_RETRIES times. Other
+        responses (including 2xx and non-429 4xx) are returned to the caller as-is.
+        """
+        kwargs.setdefault("timeout", self.timeout)
+        transient_attempts = 0
+        rate_limit_attempts = 0
+        while True:
+            try:
+                response = self.session.request(method, url, **kwargs)
+            except requests.RequestException as exc:
+                transient_attempts += 1
+                if transient_attempts > PARADIGM_MAX_RETRIES:
+                    raise
+                wait = min(PARADIGM_BACKOFF_BASE * (2 ** (transient_attempts - 1)), PARADIGM_BACKOFF_MAX)
+                logger.warning(
+                    "Paradigm request error (%s %s): %s; retry %d/%d in %.1fs",
+                    method, url, exc, transient_attempts, PARADIGM_MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+                continue
+
+            if response.status_code == 429:
+                wait = self._retry_after_seconds(response, rate_limit_attempts)
+                rate_limit_attempts += 1
+                logger.warning(
+                    "Paradigm rate limited (429 on %s %s); retry %d in %.1fs",
+                    method, url, rate_limit_attempts, wait,
+                )
+                time.sleep(wait)
+                continue
+
+            if response.status_code >= 500:
+                transient_attempts += 1
+                if transient_attempts > PARADIGM_MAX_RETRIES:
+                    return response
+                wait = min(PARADIGM_BACKOFF_BASE * (2 ** (transient_attempts - 1)), PARADIGM_BACKOFF_MAX)
+                logger.warning(
+                    "Paradigm server error (%d on %s %s); retry %d/%d in %.1fs",
+                    response.status_code, method, url, transient_attempts, PARADIGM_MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+                continue
+
+            return response
+
     def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         # Always pull the API's maximum candidate pool so the reranker sees as many
         # chunks as possible; then dedup by docid (best chunk per doc) and take top-k
@@ -100,7 +168,7 @@ class ParadigmSearcher(BaseSearcher):
         if self.workspace_id is not None:
             payload["workspace_id"] = [self.workspace_id]
 
-        r = self.session.post(f"{self.base_url}/api/v3/search", json=payload, timeout=self.timeout)
+        r = self._request("POST", f"{self.base_url}/api/v3/search", json=payload)
         r.raise_for_status()
         results = r.json().get("results", [])
 
@@ -154,7 +222,7 @@ class ParadigmSearcher(BaseSearcher):
         if self.workspace_id is not None:
             params["workspace_id"] = self.workspace_id
 
-        r = self.session.get(f"{self.base_url}/api/v3/files", params=params, timeout=self.timeout)
+        r = self._request("GET", f"{self.base_url}/api/v3/files", params=params)
         r.raise_for_status()
         results = r.json().get("results", [])
         if not results:
@@ -171,10 +239,10 @@ class ParadigmSearcher(BaseSearcher):
         if file_id is None:
             return None
 
-        r = self.session.get(
+        r = self._request(
+            "GET",
             f"{self.base_url}/api/v3/files/{file_id}",
             params={"include_content": "true"},
-            timeout=self.timeout,
         )
         if r.status_code == 404:
             return None
