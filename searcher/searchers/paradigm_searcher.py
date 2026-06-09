@@ -141,6 +141,16 @@ class ParadigmSearcher(BaseSearcher):
                 time.sleep(wait)
                 continue
 
+            if 400 <= response.status_code < 500:
+                # Client errors other than 429 are deterministic: retrying the same
+                # payload cannot succeed. Log the body (e.g. 422 field errors) and
+                # hand the response back to the caller.
+                logger.error(
+                    "Paradigm client error (%d on %s %s): %s",
+                    response.status_code, method, url, response.text[:500],
+                )
+                return response
+
             if response.status_code >= 500:
                 transient_attempts += 1
                 if transient_attempts > PARADIGM_MAX_RETRIES:
@@ -191,10 +201,13 @@ class ParadigmSearcher(BaseSearcher):
             if file_id is not None:
                 self._docid_to_file_id[docid] = int(file_id)
 
-            score = hit.get("score") or {}
-            score_value = score.get("reranking")
+            # v3 schema: "score" is the fused float; "scores" holds the per-signal
+            # breakdown, where "relevance" is the reranker confidence (null when
+            # skip_rerank=true).
+            scores = hit.get("scores") or {}
+            score_value = scores.get("relevance")
             if score_value is None:
-                score_value = score.get("retrieval", 0.0)
+                score_value = hit.get("score")
             score_value = float(score_value) if score_value is not None else 0.0
 
             existing = best_per_docid.get(docid)
