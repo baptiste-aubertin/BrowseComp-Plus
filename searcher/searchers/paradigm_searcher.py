@@ -19,10 +19,9 @@ logger = logging.getLogger(__name__)
 
 PARADIGM_MAX_RESULTS = 50
 
-# Retry tuning. 429 (rate limited) is retried indefinitely until it succeeds;
-# connection errors and 5xx are retried a bounded number of times. Backoff is
+# Retry tuning. Transient failures (429 rate limits, connection errors, and 5xx
+# responses) are all retried indefinitely until the request passes. Backoff is
 # capped exponential, honoring a Retry-After header when the server sends one.
-PARADIGM_MAX_RETRIES = 5
 PARADIGM_BACKOFF_BASE = 1.0
 PARADIGM_BACKOFF_MAX = 60.0
 
@@ -107,11 +106,11 @@ class ParadigmSearcher(BaseSearcher):
         return min(PARADIGM_BACKOFF_BASE * (2 ** attempt), PARADIGM_BACKOFF_MAX)
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Issue an HTTP request with retries.
+        """Issue an HTTP request, retrying anything that isn't a success indefinitely.
 
-        429 responses are retried indefinitely (until the request passes). Connection
-        errors and 5xx responses are retried up to PARADIGM_MAX_RETRIES times. Other
-        responses (including 2xx and non-429 4xx) are returned to the caller as-is.
+        Connection errors and any non-2xx/3xx response are retried forever until the
+        request succeeds. 429 rate limits honor a Retry-After header when present.
+        Only a successful (response.ok) response is returned to the caller.
         """
         kwargs.setdefault("timeout", self.timeout)
         transient_attempts = 0
@@ -120,16 +119,17 @@ class ParadigmSearcher(BaseSearcher):
             try:
                 response = self.session.request(method, url, **kwargs)
             except requests.RequestException as exc:
+                wait = min(PARADIGM_BACKOFF_BASE * (2 ** transient_attempts), PARADIGM_BACKOFF_MAX)
                 transient_attempts += 1
-                if transient_attempts > PARADIGM_MAX_RETRIES:
-                    raise
-                wait = min(PARADIGM_BACKOFF_BASE * (2 ** (transient_attempts - 1)), PARADIGM_BACKOFF_MAX)
                 logger.warning(
-                    "Paradigm request error (%s %s): %s; retry %d/%d in %.1fs",
-                    method, url, exc, transient_attempts, PARADIGM_MAX_RETRIES, wait,
+                    "Paradigm request error (%s %s): %s; retry %d in %.1fs",
+                    method, url, exc, transient_attempts, wait,
                 )
                 time.sleep(wait)
                 continue
+
+            if response.ok:
+                return response
 
             if response.status_code == 429:
                 wait = self._retry_after_seconds(response, rate_limit_attempts)
@@ -138,22 +138,14 @@ class ParadigmSearcher(BaseSearcher):
                     "Paradigm rate limited (429 on %s %s); retry %d in %.1fs",
                     method, url, rate_limit_attempts, wait,
                 )
-                time.sleep(wait)
-                continue
-
-            if response.status_code >= 500:
+            else:
+                wait = min(PARADIGM_BACKOFF_BASE * (2 ** transient_attempts), PARADIGM_BACKOFF_MAX)
                 transient_attempts += 1
-                if transient_attempts > PARADIGM_MAX_RETRIES:
-                    return response
-                wait = min(PARADIGM_BACKOFF_BASE * (2 ** (transient_attempts - 1)), PARADIGM_BACKOFF_MAX)
                 logger.warning(
-                    "Paradigm server error (%d on %s %s); retry %d/%d in %.1fs",
-                    response.status_code, method, url, transient_attempts, PARADIGM_MAX_RETRIES, wait,
+                    "Paradigm error (%d on %s %s); retry %d in %.1fs",
+                    response.status_code, method, url, transient_attempts, wait,
                 )
-                time.sleep(wait)
-                continue
-
-            return response
+            time.sleep(wait)
 
     def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         # Always pull the API's maximum candidate pool so the reranker sees as many
@@ -244,9 +236,6 @@ class ParadigmSearcher(BaseSearcher):
             f"{self.base_url}/api/v3/files/{file_id}",
             params={"include_content": "true"},
         )
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
         body = r.json()
         text = body.get("content")
         if text is None:
