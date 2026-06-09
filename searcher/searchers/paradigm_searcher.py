@@ -19,10 +19,9 @@ logger = logging.getLogger(__name__)
 
 PARADIGM_MAX_RESULTS = 50
 
-# Retry tuning. 429 (rate limited) is retried indefinitely until it succeeds;
-# connection errors and 5xx are retried a bounded number of times. Backoff is
+# Retry tuning. Transient failures (429 rate limits, connection errors, and 5xx
+# responses) are all retried indefinitely until the request passes. Backoff is
 # capped exponential, honoring a Retry-After header when the server sends one.
-PARADIGM_MAX_RETRIES = 5
 PARADIGM_BACKOFF_BASE = 1.0
 PARADIGM_BACKOFF_MAX = 60.0
 
@@ -107,11 +106,11 @@ class ParadigmSearcher(BaseSearcher):
         return min(PARADIGM_BACKOFF_BASE * (2 ** attempt), PARADIGM_BACKOFF_MAX)
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Issue an HTTP request with retries.
+        """Issue an HTTP request, retrying transient failures indefinitely.
 
-        429 responses are retried indefinitely (until the request passes). Connection
-        errors and 5xx responses are retried up to PARADIGM_MAX_RETRIES times. Other
-        responses (including 2xx and non-429 4xx) are returned to the caller as-is.
+        Connection errors, 429 rate limits, and 5xx responses are retried forever
+        until the request succeeds (429 honors a Retry-After header when present).
+        Other 4xx responses are deterministic and returned to the caller as-is.
         """
         kwargs.setdefault("timeout", self.timeout)
         transient_attempts = 0
@@ -120,16 +119,17 @@ class ParadigmSearcher(BaseSearcher):
             try:
                 response = self.session.request(method, url, **kwargs)
             except requests.RequestException as exc:
+                wait = min(PARADIGM_BACKOFF_BASE * (2 ** transient_attempts), PARADIGM_BACKOFF_MAX)
                 transient_attempts += 1
-                if transient_attempts > PARADIGM_MAX_RETRIES:
-                    raise
-                wait = min(PARADIGM_BACKOFF_BASE * (2 ** (transient_attempts - 1)), PARADIGM_BACKOFF_MAX)
                 logger.warning(
-                    "Paradigm request error (%s %s): %s; retry %d/%d in %.1fs",
-                    method, url, exc, transient_attempts, PARADIGM_MAX_RETRIES, wait,
+                    "Paradigm request error (%s %s): %s; retry %d in %.1fs",
+                    method, url, exc, transient_attempts, wait,
                 )
                 time.sleep(wait)
                 continue
+
+            if response.ok:
+                return response
 
             if response.status_code == 429:
                 wait = self._retry_after_seconds(response, rate_limit_attempts)
@@ -151,19 +151,14 @@ class ParadigmSearcher(BaseSearcher):
                 )
                 return response
 
-            if response.status_code >= 500:
-                transient_attempts += 1
-                if transient_attempts > PARADIGM_MAX_RETRIES:
-                    return response
-                wait = min(PARADIGM_BACKOFF_BASE * (2 ** (transient_attempts - 1)), PARADIGM_BACKOFF_MAX)
-                logger.warning(
-                    "Paradigm server error (%d on %s %s); retry %d/%d in %.1fs",
-                    response.status_code, method, url, transient_attempts, PARADIGM_MAX_RETRIES, wait,
-                )
-                time.sleep(wait)
-                continue
-
-            return response
+            # 5xx: retry indefinitely with capped backoff.
+            wait = min(PARADIGM_BACKOFF_BASE * (2 ** transient_attempts), PARADIGM_BACKOFF_MAX)
+            transient_attempts += 1
+            logger.warning(
+                "Paradigm server error (%d on %s %s); retry %d in %.1fs",
+                response.status_code, method, url, transient_attempts, wait,
+            )
+            time.sleep(wait)
 
     def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         # Always pull the API's maximum candidate pool so the reranker sees as many
