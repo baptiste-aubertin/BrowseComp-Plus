@@ -21,9 +21,8 @@ PARADIGM_MAX_RESULTS = 50
 
 # Retry tuning. Transient failures (429 rate limits, connection errors, and 5xx
 # responses) are all retried indefinitely until the request passes. Backoff is
-# capped exponential, honoring a Retry-After header when the server sends one.
+# uncapped exponential, honoring a Retry-After header when the server sends one.
 PARADIGM_BACKOFF_BASE = 1.0
-PARADIGM_BACKOFF_MAX = 60.0
 
 
 class ParadigmSearcher(BaseSearcher):
@@ -96,14 +95,14 @@ class ParadigmSearcher(BaseSearcher):
 
     @staticmethod
     def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
-        """Seconds to wait before retrying: Retry-After header if present, else capped backoff."""
+        """Seconds to wait before retrying: Retry-After header if present, else exponential backoff."""
         retry_after = response.headers.get("Retry-After")
         if retry_after:
             try:
-                return min(float(retry_after), PARADIGM_BACKOFF_MAX)
+                return float(retry_after)
             except ValueError:
                 pass
-        return min(PARADIGM_BACKOFF_BASE * (2 ** attempt), PARADIGM_BACKOFF_MAX)
+        return PARADIGM_BACKOFF_BASE * (2 ** attempt)
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Issue an HTTP request, retrying transient failures indefinitely.
@@ -119,7 +118,7 @@ class ParadigmSearcher(BaseSearcher):
             try:
                 response = self.session.request(method, url, **kwargs)
             except requests.RequestException as exc:
-                wait = min(PARADIGM_BACKOFF_BASE * (2 ** transient_attempts), PARADIGM_BACKOFF_MAX)
+                wait = PARADIGM_BACKOFF_BASE * (2 ** transient_attempts)
                 transient_attempts += 1
                 logger.warning(
                     "Paradigm request error (%s %s): %s; retry %d in %.1fs",
@@ -151,8 +150,8 @@ class ParadigmSearcher(BaseSearcher):
                 )
                 return response
 
-            # 5xx: retry indefinitely with capped backoff.
-            wait = min(PARADIGM_BACKOFF_BASE * (2 ** transient_attempts), PARADIGM_BACKOFF_MAX)
+            # 5xx: retry indefinitely with uncapped exponential backoff.
+            wait = PARADIGM_BACKOFF_BASE * (2 ** transient_attempts)
             transient_attempts += 1
             logger.warning(
                 "Paradigm server error (%d on %s %s); retry %d in %.1fs",
