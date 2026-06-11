@@ -1,0 +1,18 @@
+# Container for running scripts_evaluation/ (LLM-as-judge with vLLM).
+# The official vLLM image ships CUDA, vllm, numpy, tqdm and the Python dev
+# headers needed by triton/torch.compile — everything evaluate_run.py needs.
+#
+# Build (default matches the vllm>=0.9.0 pin in pyproject.toml):
+#   docker build -f docker/Dockerfile.eval -t browsecomp-plus-eval docker/
+# Or reuse a locally cached vLLM image to skip the pull:
+#   docker build -f docker/Dockerfile.eval -t browsecomp-plus-eval \
+#     --build-arg VLLM_IMAGE=vllm/vllm-openai:v0.22.1 docker/
+ARG VLLM_IMAGE=vllm/vllm-openai:v0.9.0
+FROM ${VLLM_IMAGE}
+
+WORKDIR /workspace
+
+# The base image's entrypoint launches the OpenAI API server; we run our own
+# scripts instead. The repo is bind-mounted at /workspace by docker/run_eval.sh.
+ENTRYPOINT []
+CMD ["bash"]

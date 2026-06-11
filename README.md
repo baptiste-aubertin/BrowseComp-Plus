@@ -114,6 +114,13 @@ python scripts_evaluation/evaluate_run.py --input_dir runs/my_model
 ```
 where you may pass in `--tensor_parallel_size {num_gpus}` to adjust the number of GPUs you have available.
 
+Alternatively, run the evaluation inside Docker (no host Python environment, dev headers, or NCCL networking setup needed):
+
+```bash
+GPUS=0,1 ./docker/run_eval.sh --input_dir runs/my_model
+```
+See [docker/README.md](docker/README.md) for details.
+
 > Note that the script above evalutes using Qwen3-32B as a judge. For more details on evaluation, please refer to [docs/llm_as_judge.md](docs/llm_as_judge.md).
 
 ### Submitting to the Leaderboard
