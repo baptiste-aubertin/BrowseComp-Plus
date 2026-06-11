@@ -2,7 +2,7 @@
 
 Example:
     python scripts_paradigm/run_empty_query.py --query-id 770
-    python scripts_paradigm/run_empty_query.py --query-id 770 --skip-rerank
+    python scripts_paradigm/run_empty_query.py --query-id 770 --relevance-scoring scoring_only
 """
 
 import argparse
@@ -40,7 +40,7 @@ ParadigmSearcher = _load_paradigm_searcher()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    ParadigmSearcher.parse_args(parser)  # adds --base-url, --api-key, --skip-rerank, etc.
+    ParadigmSearcher.parse_args(parser)  # adds --base-url, --api-key, --relevance-scoring, etc.
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV, help=f"CSV file (default: {DEFAULT_CSV})")
     parser.add_argument("--query-id", required=True, help="query_id to run (all CSV rows with this id).")
     parser.add_argument("--row", type=int, default=None,
@@ -61,7 +61,7 @@ def main() -> None:
         rows = [rows[args.row]]
 
     searcher = ParadigmSearcher(args)
-    print(f"query_id={args.query_id}: {len(rows)} quer(y/ies), skip_rerank={args.skip_rerank}")
+    print(f"query_id={args.query_id}: {len(rows)} quer(y/ies), relevance_scoring={searcher.relevance_scoring}")
 
     for n, row in enumerate(rows):
         query = row["search_query"]

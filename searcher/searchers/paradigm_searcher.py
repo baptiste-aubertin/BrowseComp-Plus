@@ -19,6 +19,17 @@ logger = logging.getLogger(__name__)
 
 PARADIGM_MAX_RESULTS = 50
 
+# Cross-encoder (reranker) modes for /api/v3/search
+# (paradigm-mission-control #3685 / #3745):
+# - scoring_and_filtering: score candidates, return only those above the quality
+#   threshold; when none clears it, an adaptive fallback returns the few best
+#   instead of an empty result. API default.
+# - scoring_only: score every candidate and return them all (no threshold filter);
+#   every chunk carries scores.relevance.
+# - none: skip relevance scoring entirely (scores.relevance is null). Fastest.
+RELEVANCE_SCORING_CHOICES = ["scoring_and_filtering", "scoring_only", "none"]
+DEFAULT_RELEVANCE_SCORING = "scoring_and_filtering"
+
 # Retry tuning. Transient failures (429 rate limits, connection errors, and 5xx
 # responses) are all retried indefinitely until the request passes. Backoff is
 # uncapped exponential, honoring a Retry-After header when the server sends one.
@@ -53,10 +64,15 @@ class ParadigmSearcher(BaseSearcher):
             help="Search mode: 'text' (hybrid) or 'vision' (VLM page-image). Default: text.",
         )
         parser.add_argument(
-            "--skip-rerank",
-            action="store_true",
-            default=False,
-            help="Skip reranking for lower latency (score.reranking will be null).",
+            "--relevance-scoring",
+            choices=RELEVANCE_SCORING_CHOICES,
+            default=DEFAULT_RELEVANCE_SCORING,
+            help=(
+                "Cross-encoder relevance scoring mode: 'scoring_and_filtering' "
+                "(default; threshold-filtered with adaptive fallback on empty), "
+                "'scoring_only' (score all candidates, no filtering), or 'none' "
+                "(skip scoring, scores.relevance null; fastest)."
+            ),
         )
         parser.add_argument(
             "--request-timeout",
@@ -76,7 +92,7 @@ class ParadigmSearcher(BaseSearcher):
         self.base_url = args.base_url.rstrip("/")
         self.workspace_id = args.workspace_id
         self.mode = args.mode
-        self.skip_rerank = args.skip_rerank
+        self.relevance_scoring = args.relevance_scoring
         self.timeout = args.request_timeout
 
         self.session = requests.Session()
@@ -86,11 +102,11 @@ class ParadigmSearcher(BaseSearcher):
         self._docid_to_file_id: Dict[str, int] = {}
 
         logger.info(
-            "Paradigm searcher ready (base_url=%s workspace_id=%s mode=%s skip_rerank=%s)",
+            "Paradigm searcher ready (base_url=%s workspace_id=%s mode=%s relevance_scoring=%s)",
             self.base_url,
             self.workspace_id,
             self.mode,
-            self.skip_rerank,
+            self.relevance_scoring,
         )
 
     @staticmethod
@@ -160,14 +176,18 @@ class ParadigmSearcher(BaseSearcher):
             time.sleep(wait)
 
     def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
-        # Always pull the API's maximum candidate pool so the reranker sees as many
-        # chunks as possible; then dedup by docid (best chunk per doc) and take top-k
-        # unique docids. Billing is one search credit regardless of max_results.
+        # Always pull the API's maximum candidate pool; the cross-encoder scores
+        # exactly these max_results candidates (no overfetched tail since #3685).
+        # Then dedup by docid (best chunk per doc) and take top-k unique docids.
+        # Billing is one search credit regardless of max_results. Note that in
+        # scoring_and_filtering mode the API may return fewer than max_results
+        # chunks (threshold filtering), so fewer than k unique docs is possible;
+        # use --relevance-scoring scoring_only to keep the full scored pool.
         payload: Dict[str, Any] = {
             "query": query,
             "max_results": PARADIGM_MAX_RESULTS,
             "mode": self.mode,
-            "skip_rerank": self.skip_rerank,
+            "relevance_scoring": self.relevance_scoring,
         }
         if self.workspace_id is not None:
             payload["workspace_id"] = [self.workspace_id]
@@ -197,7 +217,7 @@ class ParadigmSearcher(BaseSearcher):
 
             # v3 schema: "score" is the fused float; "scores" holds the per-signal
             # breakdown, where "relevance" is the reranker confidence (null when
-            # skip_rerank=true).
+            # relevance_scoring="none").
             scores = hit.get("scores") or {}
             score_value = scores.get("relevance")
             if score_value is None:
