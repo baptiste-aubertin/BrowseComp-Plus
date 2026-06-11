@@ -15,6 +15,8 @@ import torch
 import transformers
 from tqdm import tqdm
 
+from utils import add_subsample_args, subsample_query_ids
+
 parser = argparse.ArgumentParser(description="Run batch inference with Search-R1")
 parser.add_argument(
     "--query",
@@ -37,6 +39,7 @@ parser.add_argument(
 parser.add_argument(
     "--port", type=int, default=8001, help="Port to use for the search engine"
 )
+add_subsample_args(parser)
 args = parser.parse_args()
 
 os.makedirs(args.output_dir, exist_ok=True)
@@ -46,6 +49,19 @@ if args.query.endswith(".tsv"):
     questions_to_process = pd.read_csv(
         args.query, sep="\t", header=None, names=["id", "question"]
     )
+    if args.subsample_size > 0:
+        keep = subsample_query_ids(
+            questions_to_process["id"].astype(str),
+            args.subsample_size,
+            args.subsample_seed,
+        )
+        questions_to_process = questions_to_process[
+            questions_to_process["id"].astype(str).isin(keep)
+        ]
+        print(
+            f"Subsampled {len(questions_to_process)} questions "
+            f"(size={args.subsample_size}, seed={args.subsample_seed})"
+        )
     print(f"Processing {len(questions_to_process)} questions")
 else:
     print(f"Processing single question: {args.query[:100]}...")

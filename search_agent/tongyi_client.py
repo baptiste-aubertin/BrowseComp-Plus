@@ -16,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from tongyi_utils.react_agent import MultiTurnReactAgent
 from tongyi_utils.tool_search import SearchToolHandler
 from searcher.searchers import SearcherType
+from utils import add_subsample_args, subsample_queries
 import re
 
 
@@ -145,7 +146,13 @@ def process_tsv_dataset(tsv_path: str, agent: MultiTurnReactAgent, args, output_
             if len(row) < 2:
                 continue  # skip malformed lines
             queries.append((row[0].strip(), row[1].strip()))
-    
+
+    if args.subsample_size > 0:
+        queries = subsample_queries(queries, args.subsample_size, args.subsample_seed)
+        print(
+            f"Subsampled {len(queries)} queries (size={args.subsample_size}, seed={args.subsample_seed})"
+        )
+
     processed_ids = set()
     if output_dir.exists():
         for json_path in output_dir.glob("run_*.json"):
@@ -202,6 +209,7 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--presence_penalty", type=float, default=1.1)
     parser.add_argument("--num-threads", type=int, default=10, help="Number of parallel threads for processing queries")
+    add_subsample_args(parser)
     parser.add_argument("--port", type=int, default=6008, help="LLM server port")
     parser.add_argument("--store-raw", action="store_true", help="Store raw messages in the output JSON")
 

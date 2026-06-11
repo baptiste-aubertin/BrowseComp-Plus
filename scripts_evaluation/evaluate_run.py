@@ -14,6 +14,8 @@ from vllm import LLM, SamplingParams
 
 sys.path.append(str(Path(__file__).parent.parent))
 
+from search_agent.utils import add_subsample_args, subsample_query_ids
+
 GRADER_TEMPLATE = """
 Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
 
@@ -425,6 +427,7 @@ def main():
         default=1,
         help="Tensor parallel size for vLLM",
     )
+    add_subsample_args(parser)
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -438,6 +441,15 @@ def main():
 
     print(f"Loading ground truth from {gt_path}")
     ground_truth = load_ground_truth(gt_path)
+
+    sampled_qids = subsample_query_ids(
+        ground_truth.keys(), args.subsample_size, args.subsample_seed
+    )
+    if args.subsample_size > 0:
+        print(
+            f"Evaluating on a subsample of {len(sampled_qids)} queries "
+            f"(size={args.subsample_size}, seed={args.subsample_seed})"
+        )
 
     qrel_evidence_path = Path(args.qrel_evidence)
 
@@ -487,7 +499,8 @@ def main():
             try:
                 with eval_path.open("r", encoding="utf-8") as f:
                     existing_eval = json.load(f)
-                all_results.append(existing_eval)
+                if str(existing_eval.get("query_id")) in sampled_qids:
+                    all_results.append(existing_eval)
                 continue
             except Exception:
                 pass  # fall through to re-evaluate
@@ -502,6 +515,8 @@ def main():
         query_id = run_data.get("query_id")
         if not query_id or str(query_id) not in ground_truth:
             print(f"No ground truth for query_id {query_id} in {json_path}")
+            continue
+        if str(query_id) not in sampled_qids:
             continue
 
         correct_answer = ground_truth[str(query_id)]["answer"]

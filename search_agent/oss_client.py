@@ -16,7 +16,11 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from utils import extract_retrieved_docids_from_result
+from utils import (
+    add_subsample_args,
+    extract_retrieved_docids_from_result,
+    subsample_queries,
+)
 
 from searcher.searchers import SearcherType
 
@@ -335,6 +339,12 @@ def _process_tsv_dataset(
                 continue
             queries.append((row[0].strip(), row[1].strip()))
 
+    if args.subsample_size > 0:
+        queries = subsample_queries(queries, args.subsample_size, args.subsample_seed)
+        print(
+            f"Subsampled {len(queries)} queries (size={args.subsample_size}, seed={args.subsample_seed})"
+        )
+
     processed_ids = set()
     if out_dir.exists():
         for json_path in out_dir.glob("run_*.json"):
@@ -445,6 +455,7 @@ def main():
     parser.add_argument(
         "--num-threads", type=int, default=1, help="Parallel threads for dataset mode"
     )
+    add_subsample_args(parser)
     parser.add_argument(
         "--max-iterations",
         type=int,

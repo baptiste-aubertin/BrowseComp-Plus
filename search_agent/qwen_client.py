@@ -16,7 +16,11 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils import extract_retrieved_docids_from_result
+from utils import (
+    add_subsample_args,
+    extract_retrieved_docids_from_result,
+    subsample_queries,
+)
 
 load_dotenv()
 
@@ -180,6 +184,12 @@ def _process_tsv_dataset(tsv_path: str, agent: Assistant, args):
             assert len(row) == 2, f"Malformed row: {row}"
             queries.append((row[0].strip(), row[1].strip()))
 
+    if args.subsample_size > 0:
+        queries = subsample_queries(queries, args.subsample_size, args.subsample_seed)
+        print(
+            f"Subsampled {len(queries)} queries (size={args.subsample_size}, seed={args.subsample_seed})"
+        )
+
     processed_ids: set[str] = set()
     if out_dir.exists():
         for json_path in out_dir.glob("run_*.json"):
@@ -265,6 +275,7 @@ def main():
         default="runs/bm25/qwen_32b",
         help="Directory to store logs (default: %(default)s)",
     )
+    add_subsample_args(parser)
     args = parser.parse_args()
 
     agent = init_qwen_agent(

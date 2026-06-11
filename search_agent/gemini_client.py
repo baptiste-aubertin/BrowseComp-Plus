@@ -18,7 +18,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 load_dotenv()
 
-from utils import extract_retrieved_docids_from_result
+from utils import (
+    add_subsample_args,
+    extract_retrieved_docids_from_result,
+    subsample_queries,
+)
 
 
 def init_gemini_client(model: str, mcp_url: str, max_tokens: int = 1000):
@@ -239,6 +243,12 @@ async def _process_tsv_dataset(tsv_path: str, gemini_client, mcp_client, config,
             assert len(row) == 2, f"Malformed row: {row}"
             queries.append((row[0].strip(), row[1].strip()))
 
+    if args.subsample_size > 0:
+        queries = subsample_queries(queries, args.subsample_size, args.subsample_seed)
+        print(
+            f"Subsampled {len(queries)} queries (size={args.subsample_size}, seed={args.subsample_seed})"
+        )
+
     processed_ids: set[str] = set()
     if out_dir.exists():
         for json_path in out_dir.glob("run_*.json"):
@@ -354,6 +364,7 @@ async def main():
         default=1,
         help="Number of parallel threads for dataset processing (default: %(default)s)",
     )
+    add_subsample_args(parser)
     parser.add_argument(
         "--store-raw",
         action="store_true",
