@@ -8,11 +8,11 @@ Three actions (combinable):
 Docids are matched via external_metadata.external_id. Reruns are idempotent — only
 docids that need work get touched.
 
-Documents are truncated before upload to the exact text window the upstream
-Reason-ModernColBERT PLAID index saw. PyLate (models/colbert.py, tokenize()) encodes
-documents as [CLS] [D] <text> [SEP] capped at --document-length total tokens, so the
-usable text window is document_length - 1 (prefix) - 2 (CLS/SEP) = 509 content tokens
-of the lightonai/Reason-ModernColBERT tokenizer for the default 512.
+Documents are truncated before upload to mirror the upstream benchmark's 512-token
+document window (build_pylate_index.py --document-length 512), counted with the
+lightonai/DenseOn-multilingual tokenizer (the Paradigm embedder): each doc is cut so
+that <bos> <text> <eos> fits in --document-length tokens, i.e. document_length - 2
+content tokens (510 for the default 512).
 """
 
 import argparse
@@ -25,7 +25,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 
 load_dotenv()
 
@@ -33,7 +33,7 @@ BASE_URL = os.environ["PARADIGM_BASE_URL"].rstrip("/")
 API_KEY = os.environ["PARADIGM_API_KEY"]
 WORKSPACE_ID = int(os.environ["PARADIGM_WORKSPACE_ID"])
 
-TOKENIZER_NAME = "lightonai/Reason-ModernColBERT"
+TOKENIZER_NAME = "lightonai/DenseOn-multilingual"
 
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 FAIL_STATUSES = {"parsing_failed", "embedding_failed", "fail"}
@@ -181,13 +181,15 @@ def redo_failed(session: requests.Session, docid: str, file_row: dict, corpus: d
 
 
 def truncate_texts(texts: list[str], document_length: int, batch_size: int = 256) -> list[str]:
-    """Truncate each text to the window PyLate indexed: document_length total minus
-    1 slot for the [D] prefix and num_special_tokens_to_add() for [CLS]/[SEP]
-    (pylate models/colbert.py sets max_seq_length = document_length - 1 and then
-    inserts the prefix). Texts under the limit are kept verbatim rather than
+    """Truncate each text so the embedder input <bos> <text> <eos> fits in
+    document_length tokens, i.e. document_length - num_special_tokens_to_add()
+    content tokens. Texts under the limit are kept verbatim rather than
     round-tripped through the tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    max_tokens = document_length - 1 - tokenizer.num_special_tokens_to_add(False)
+    # The repo's tokenizer_config declares the transformers-v5 TokenizersBackend
+    # class, which AutoTokenizer in transformers 4.x can't resolve; loading through
+    # PreTrainedTokenizerFast reads tokenizer.json directly.
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(TOKENIZER_NAME)
+    max_tokens = document_length - tokenizer.num_special_tokens_to_add(False)
     out: list[str] = []
     n_truncated = 0
     for i in tqdm(range(0, len(texts), batch_size), desc="truncate", unit="batch"):
@@ -239,8 +241,8 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument(
         "--document-length", type=int, default=512,
-        help="PyLate document_length to replicate (same flag as the upstream "
-             f"build_pylate_index.py): docs are cut to document_length - 3 content tokens "
+        help="Document window to replicate (same flag as the upstream "
+             f"build_pylate_index.py): docs are cut to document_length - 2 content tokens "
              f"of the {TOKENIZER_NAME} tokenizer before upload. 0 disables.",
     )
     parser.add_argument(
