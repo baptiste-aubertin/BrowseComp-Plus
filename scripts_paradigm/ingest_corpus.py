@@ -7,6 +7,12 @@ Three actions (combinable):
 
 Docids are matched via external_metadata.external_id. Reruns are idempotent — only
 docids that need work get touched.
+
+Documents are truncated before upload to the exact text window the upstream
+Reason-ModernColBERT PLAID index saw. PyLate (models/colbert.py, tokenize()) encodes
+documents as [CLS] [D] <text> [SEP] capped at --document-length total tokens, so the
+usable text window is document_length - 1 (prefix) - 2 (CLS/SEP) = 509 content tokens
+of the lightonai/Reason-ModernColBERT tokenizer for the default 512.
 """
 
 import argparse
@@ -19,12 +25,15 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 load_dotenv()
 
 BASE_URL = os.environ["PARADIGM_BASE_URL"].rstrip("/")
 API_KEY = os.environ["PARADIGM_API_KEY"]
 WORKSPACE_ID = int(os.environ["PARADIGM_WORKSPACE_ID"])
+
+TOKENIZER_NAME = "lightonai/Reason-ModernColBERT"
 
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 FAIL_STATUSES = {"parsing_failed", "embedding_failed", "fail"}
@@ -171,13 +180,45 @@ def redo_failed(session: requests.Session, docid: str, file_row: dict, corpus: d
     return upload_doc(session, docid, text, url)
 
 
-def load_corpus(path: Path) -> dict[str, tuple[str, str]]:
-    corpus: dict[str, tuple[str, str]] = {}
+def truncate_texts(texts: list[str], document_length: int, batch_size: int = 256) -> list[str]:
+    """Truncate each text to the window PyLate indexed: document_length total minus
+    1 slot for the [D] prefix and num_special_tokens_to_add() for [CLS]/[SEP]
+    (pylate models/colbert.py sets max_seq_length = document_length - 1 and then
+    inserts the prefix). Texts under the limit are kept verbatim rather than
+    round-tripped through the tokenizer."""
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    max_tokens = document_length - 1 - tokenizer.num_special_tokens_to_add(False)
+    out: list[str] = []
+    n_truncated = 0
+    for i in tqdm(range(0, len(texts), batch_size), desc="truncate", unit="batch"):
+        batch = texts[i : i + batch_size]
+        encoded = tokenizer(batch, add_special_tokens=False)["input_ids"]
+        for text, tokens in zip(batch, encoded):
+            if len(tokens) > max_tokens:
+                out.append(tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True))
+                n_truncated += 1
+            else:
+                out.append(text)
+    print(
+        f"  truncated {n_truncated:,}/{len(texts):,} docs to {max_tokens} content tokens "
+        f"(document_length={document_length})"
+    )
+    return out
+
+
+def load_corpus(path: Path, document_length: int = 512) -> dict[str, tuple[str, str]]:
+    docids: list[str] = []
+    texts: list[str] = []
+    urls: list[str] = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             row = json.loads(line)
-            corpus[str(row["docid"])] = (row.get("text", ""), row.get("url", "") or "")
-    return corpus
+            docids.append(str(row["docid"]))
+            texts.append(row.get("text", ""))
+            urls.append(row.get("url", "") or "")
+    if document_length and document_length > 0:
+        texts = truncate_texts(texts, document_length)
+    return {d: (t, u) for d, t, u in zip(docids, texts, urls)}
 
 
 def parse_retry_ids(docids_csv: str, corpus_docids: set[str]) -> set[str]:
@@ -197,6 +238,12 @@ def main() -> None:
     )
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument(
+        "--document-length", type=int, default=512,
+        help="PyLate document_length to replicate (same flag as the upstream "
+             f"build_pylate_index.py): docs are cut to document_length - 3 content tokens "
+             f"of the {TOKENIZER_NAME} tokenizer before upload. 0 disables.",
+    )
+    parser.add_argument(
         "--docids", type=str, default=None,
         help="Comma-separated docids to retry. Looked up per-docid; no full workspace listing.",
     )
@@ -215,7 +262,7 @@ def main() -> None:
         parser.error("specify at least one of --docids, --verify, --check-failed")
 
     s = _session()
-    corpus = load_corpus(args.input)
+    corpus = load_corpus(args.input, args.document_length)
     corpus_docids = set(corpus)
     print(f"corpus: {len(corpus):,} docids from {args.input}")
 
