@@ -223,7 +223,10 @@ def run_conversation_with_tools(
 
         for tool_call in function_calls:
             try:
-                arguments = json.loads(tool_call["arguments"])
+                # strict=False tolerates raw control characters (newlines/tabs)
+                # inside quoted strings — gpt-oss occasionally emits them in
+                # tool arguments and the search would otherwise be wasted.
+                arguments = json.loads(tool_call["arguments"], strict=False)
                 result = tool_handler.execute_tool(tool_call["name"], arguments)
                 tool_usage[tool_call["name"]] = tool_usage.get(tool_call["name"], 0) + 1
 
