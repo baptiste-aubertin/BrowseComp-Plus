@@ -160,14 +160,29 @@ def run_conversation_with_tools(
                 **request,
             )
         except Exception as e:
-            # Transient endpoint failures (e.g. a flapping replica returning
-            # harmony "Unknown channel" 400s) must not consume the tool-round
+            # Transient endpoint failures must not consume the tool-round
             # budget — retry with backoff, and only give up after a sustained
             # outage so the trajectory is marked as an infra error, not graded
             # as an agent failure.
             consecutive_errors += 1
+            err_s = str(e)
             if verbose:
                 print(f"Error ({consecutive_errors} consecutive): {e}")
+            # vLLM's harmony renderer sometimes rejects REPLAYED reasoning
+            # items ("Unknown channel: None" / "unexpected tokens remaining in
+            # message header"). The poisoned item stays in the history, so
+            # blind retries cannot recover — drop reasoning items once and
+            # retry immediately. The model re-reasons from the tool outputs;
+            # only trajectories that hit the server bug take this path.
+            if "Unknown channel" in err_s or "message header" in err_s:
+                cleaned = [
+                    m for m in messages if not (isinstance(m, dict) and m.get("type") == "reasoning")
+                ]
+                if len(cleaned) != len(messages):
+                    messages = cleaned
+                    if verbose:
+                        print("Sanitized history: dropped replayed reasoning items after harmony 400")
+                    continue
             if consecutive_errors >= 20:
                 return messages, tool_usage, "error"
             time.sleep(min(2 ** min(consecutive_errors, 5), 30))
