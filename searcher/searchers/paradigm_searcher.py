@@ -1,5 +1,6 @@
 """LightOn Paradigm Console searcher: POST /api/v3/search + GET /api/v3/files/{id}."""
 
+import json
 import logging
 import os
 import time
@@ -80,6 +81,12 @@ class ParadigmSearcher(BaseSearcher):
             ),
         )
         parser.add_argument(
+            "--corpus-path",
+            default=os.getenv("BROWSECOMP_CORPUS_PATH", "data/browsecomp_plus_corpus.jsonl"),
+            help="Local corpus JSONL with FULL document texts; get_document serves from here "
+                 "(Paradigm only stores the 512-token ingestion window).",
+        )
+        parser.add_argument(
             "--request-timeout",
             type=float,
             default=120.0,
@@ -99,6 +106,8 @@ class ParadigmSearcher(BaseSearcher):
         self.mode = args.mode
         self.relevance_scoring = args.relevance_scoring
         self.timeout = args.request_timeout
+        self.corpus_path = args.corpus_path
+        self._corpus_index = None
 
         self.session = requests.Session()
         self.session.headers["X-Api-Key"] = args.api_key
@@ -270,24 +279,35 @@ class ParadigmSearcher(BaseSearcher):
         self._docid_to_file_id[docid] = file_id
         return file_id
 
-    def get_document(self, docid: str) -> Optional[Dict[str, Any]]:
-        file_id = self._resolve_file_id(docid)
-        if file_id is None:
-            return None
+    def _corpus_offsets(self) -> Dict[str, int]:
+        """Lazy byte-offset index over the local corpus JSONL (docid -> offset).
 
-        r = self._request(
-            "GET",
-            f"{self.base_url}/api/v3/files/{file_id}",
-            params={"include_content": "true"},
-        )
-        if r.status_code == 404:
+        Paradigm stores only the 512-token ingestion window per document;
+        ``get_document`` must return the *full* original text, exactly like the
+        PyLate searcher does from the HF corpus. A seek index keeps memory flat
+        instead of holding the whole ~3 GB corpus in RAM.
+        """
+        if getattr(self, "_corpus_index", None) is None:
+            index: Dict[str, int] = {}
+            offset = 0
+            with open(self.corpus_path, "rb") as f:
+                for line in f:
+                    # docid is the first key of every corpus row — cheap parse.
+                    key = line[: line.find(b",")].split(b":", 1)[-1].strip(b' "')
+                    index[key.decode()] = offset
+                    offset += len(line)
+            logger.info("Indexed %d corpus documents from %s", len(index), self.corpus_path)
+            self._corpus_index = index
+        return self._corpus_index
+
+    def get_document(self, docid: str) -> Optional[Dict[str, Any]]:
+        offset = self._corpus_offsets().get(str(docid))
+        if offset is None:
             return None
-        r.raise_for_status()
-        body = r.json()
-        text = body.get("content")
-        if text is None:
-            return None
-        return {"docid": docid, "text": text}
+        with open(self.corpus_path, "rb") as f:
+            f.seek(offset)
+            row = json.loads(f.readline())
+        return {"docid": str(row["docid"]), "text": row.get("text", "")}
 
     @property
     def search_type(self) -> str:
@@ -301,4 +321,4 @@ class ParadigmSearcher(BaseSearcher):
         )
 
     def get_document_description(self) -> str:
-        return "Retrieve the full text content of a document by its docid from Paradigm."
+        return "Retrieve a full document by its docid."
