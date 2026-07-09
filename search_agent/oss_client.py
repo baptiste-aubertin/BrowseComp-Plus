@@ -168,21 +168,12 @@ def run_conversation_with_tools(
             err_s = str(e)
             if verbose:
                 print(f"Error ({consecutive_errors} consecutive): {e}")
-            # vLLM's harmony renderer sometimes rejects REPLAYED reasoning
-            # items ("Unknown channel: None" / "unexpected tokens remaining in
-            # message header"). The poisoned item stays in the history, so
-            # blind retries cannot recover — drop reasoning items once and
-            # retry immediately. The model re-reasons from the tool outputs;
-            # only trajectories that hit the server bug take this path.
-            if "Unknown channel" in err_s or "message header" in err_s:
-                cleaned = [
-                    m for m in messages if not (isinstance(m, dict) and m.get("type") == "reasoning")
-                ]
-                if len(cleaned) != len(messages):
-                    messages = cleaned
-                    if verbose:
-                        print("Sanitized history: dropped replayed reasoning items after harmony 400")
-                    continue
+            # Harmony 400s on replayed reasoning items are a server-side vLLM
+            # bug. Never degrade the trajectory by stripping its reasoning —
+            # retry (a healthy replica may serve the next attempt) and, if the
+            # outage is sustained, abort with status "error" so the run
+            # wrapper redoes the whole trajectory from scratch at full
+            # intelligence.
             if consecutive_errors >= 20:
                 return messages, tool_usage, "error"
             time.sleep(min(2 ** min(consecutive_errors, 5), 30))
