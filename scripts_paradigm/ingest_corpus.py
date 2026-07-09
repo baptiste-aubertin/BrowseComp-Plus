@@ -71,7 +71,15 @@ def list_workspace(
     page_num = 0
     total = None
     while True:
-        r = session.get(url, params=params, timeout=60)
+        for attempt in range(8):
+            r = session.get(url, params=params, timeout=60)
+            if r.status_code in RETRYABLE_STATUS:
+                # Honor Retry-After on 429/5xx — the files list is throttled
+                # per-minute, so a long walk must pace itself instead of dying.
+                wait = r.headers.get("Retry-After")
+                time.sleep(int(wait) if wait and wait.isdigit() else min(2**attempt * 2, 60))
+                continue
+            break
         r.raise_for_status()
         body = r.json()
         results = body.get("results", [])
@@ -114,18 +122,24 @@ def find_file_by_external_id(
     return best
 
 
-def upload_doc(session: requests.Session, docid: str, text: str, url: str) -> dict:
-    """POST /api/v3/files. WAF fallback on 403; exponential backoff on retryable 5xx."""
+def upload_doc(session: requests.Session, docid: str, text: str, url: str, filename_nonce: str = "") -> dict:
+    """POST /api/v3/files. WAF fallback on 403; exponential backoff on retryable 5xx.
+
+    filename_nonce: appended to the stored filename (never to external_id). Used on
+    delete + re-upload so the new blob lands on a fresh storage path — the async
+    hard-delete of the old row otherwise races the re-upload on the same path and
+    removes the new file (parse then dies with FileNotFoundError).
+    """
     payload = text.encode("utf-8")
     # WAF fallback variants: tried in order on 403. The Paradigm parser sniffs
     # content, so swapping Content-Type / extension is harmless for ingestion
     # but can route past a content-type-scoped WAF rule.
     variants = [("txt", "text/plain"), ("bin", "application/octet-stream"), ("md", "text/markdown")]
     idx = 0
-    files = {"file": (f"{docid}.{variants[0][0]}", payload, variants[0][1])}
+    files = {"file": (f"{docid}{filename_nonce}.{variants[0][0]}", payload, variants[0][1])}
     data = {
         "workspace_id": str(WORKSPACE_ID),
-        "filename": f"{docid}.txt",
+        "filename": f"{docid}{filename_nonce}.txt",
         "title": (url or f"doc-{docid}")[:255],
         "external_metadata": json.dumps(
             {"external_id": str(docid), "additional_metadata": {"url": url} if url else {}}
@@ -140,7 +154,7 @@ def upload_doc(session: requests.Session, docid: str, text: str, url: str) -> di
             if r.status_code == 403 and idx + 1 < len(variants):
                 idx += 1
                 ext, ctype = variants[idx]
-                files = {"file": (f"{docid}.{ext}", payload, ctype)}
+                files = {"file": (f"{docid}{filename_nonce}.{ext}", payload, ctype)}
                 continue
             if r.status_code in RETRYABLE_STATUS:
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
@@ -177,7 +191,8 @@ def redo_failed(session: requests.Session, docid: str, file_row: dict, corpus: d
     if not ok:
         return {"docid": docid, "ok": False, "error": f"delete: {err}"}
     text, url = corpus[docid]
-    return upload_doc(session, docid, text, url)
+    # Fresh storage path per retry attempt — see upload_doc(filename_nonce=...).
+    return upload_doc(session, docid, text, url, filename_nonce=f"-r{int(time.time()) % 100000}")
 
 
 def truncate_texts(texts: list[str], document_length: int, batch_size: int = 256) -> list[str]:

@@ -4,7 +4,9 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -148,6 +150,7 @@ def run_conversation_with_tools(
     messages = initial_request["input"]
 
     iteration = 1
+    consecutive_errors = 0
 
     while iteration <= max_iterations:
         try:
@@ -157,13 +160,48 @@ def run_conversation_with_tools(
                 **request,
             )
         except Exception as e:
+            # Transient endpoint failures (e.g. a flapping replica returning
+            # harmony "Unknown channel" 400s) must not consume the tool-round
+            # budget — retry with backoff, and only give up after a sustained
+            # outage so the trajectory is marked as an infra error, not graded
+            # as an agent failure.
+            consecutive_errors += 1
             if verbose:
-                print(f"Error: {e}")
-                rprint(f"Request: {request}")
-            iteration += 1
+                print(f"Error ({consecutive_errors} consecutive): {e}")
+            if consecutive_errors >= 20:
+                return messages, tool_usage, "error"
+            time.sleep(min(2 ** min(consecutive_errors, 5), 30))
             continue
+        consecutive_errors = 0
 
         response_dict = response.model_dump(mode="python")
+
+        # vLLM Responses-API quirk: once function_call_output items appear in the
+        # input, subsequent tool calls can come back typed as `mcp_call`
+        # (server_label="functions") instead of `function_call`. Normalize them so
+        # the loop below recognizes and executes them — otherwise the trajectory
+        # silently terminates after the first search round.
+        normalized_output = []
+        for item in response_dict["output"]:
+            if item.get("type") in ("mcp_call", "function_call") and item.get("name"):
+                # vLLM's harmony parser sometimes leaks channel markers and
+                # trailing junk into the tool name (e.g.
+                # "search<|channel|>commentary", "search,json"). A corrupted
+                # name fails tool dispatch and poisons the replayed history
+                # (400 "Unknown channel"). Strip to the registered name.
+                name_match = re.match(r"[A-Za-z0-9_]+", item["name"].split("<|")[0])
+                clean_name = name_match.group(0) if name_match else item["name"]
+                normalized_output.append(
+                    {
+                        "type": "function_call",
+                        "call_id": item.get("call_id") or item.get("id"),
+                        "name": clean_name,
+                        "arguments": item.get("arguments") or "{}",
+                    }
+                )
+            else:
+                normalized_output.append(item)
+        response_dict["output"] = normalized_output
 
         messages.extend(response_dict["output"])
 
@@ -518,7 +556,9 @@ def main():
 
     client = openai.OpenAI(
         base_url=args.model_url,
-        api_key="EMPTY",
+        # Auth-enabled endpoints (e.g. LightOn's gpt-oss deployment) need a real
+        # bearer token; plain vLLM ignores it, so "EMPTY" stays the default.
+        api_key=os.getenv("LLM_API_KEY", "EMPTY"),
     )
 
     searcher = searcher_class(args)

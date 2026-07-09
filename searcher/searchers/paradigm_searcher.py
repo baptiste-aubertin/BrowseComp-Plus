@@ -17,6 +17,11 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 logger = logging.getLogger(__name__)
 
+# Chunks requested per /api/v3/search call. Larger than the k=5 docs handed to
+# the LLM: the engine's internal fusion (dense + BM25 + ColBERT rerank +
+# cross-encoder) operates on this candidate pool, so a wider request improves
+# the final top-5. 50 was chosen over 100 after an offline eval on 250 labelled
+# pairs showed identical gold-in-top-5 (80.4%) at half the cross-encoder cost.
 PARADIGM_MAX_RESULTS = 50
 
 # Cross-encoder (reranker) modes for /api/v3/search
@@ -187,8 +192,12 @@ class ParadigmSearcher(BaseSearcher):
             "query": query,
             "max_results": PARADIGM_MAX_RESULTS,
             "mode": self.mode,
-            "relevance_scoring": self.relevance_scoring,
         }
+        # Newer API versions only accept explicit non-default modes in the
+        # request (choices: none / scoring_only); scoring_and_filtering is the
+        # server default and must be expressed by omitting the field.
+        if self.relevance_scoring != "scoring_and_filtering":
+            payload["relevance_scoring"] = self.relevance_scoring
         if self.workspace_id is not None:
             payload["workspace_id"] = [self.workspace_id]
 
