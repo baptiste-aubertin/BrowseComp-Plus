@@ -168,6 +168,29 @@ def run_conversation_with_tools(
             err_s = str(e)
             if verbose:
                 print(f"Error ({consecutive_errors} consecutive): {e}")
+            # Context overflow is deterministic: a get_document on a huge
+            # corpus doc can push the prompt past max_model_len and no retry
+            # can fix it. Halve the largest fetched document in the history
+            # (marked as truncated) and retry — converges in a few halvings,
+            # never touches reasoning items, and only fires on overflow.
+            if "exceeds the max_model_len" in err_s or "reduce prompt" in err_s.lower():
+                longest = None
+                for m in messages:
+                    if (
+                        isinstance(m, dict)
+                        and m.get("type") == "function_call_output"
+                        and isinstance(m.get("output"), str)
+                    ):
+                        if longest is None or len(m["output"]) > len(longest["output"]):
+                            longest = m
+                if longest is not None and len(longest["output"]) > 4000:
+                    longest["output"] = (
+                        longest["output"][: len(longest["output"]) // 2]
+                        + "\n...[truncated: document exceeds the model context window]"
+                    )
+                    if verbose:
+                        print("Context overflow: halved largest tool output and retrying")
+                    continue
             # Harmony 400s on replayed reasoning items are a server-side vLLM
             # bug. Never degrade the trajectory by stripping its reasoning —
             # retry (a healthy replica may serve the next attempt) and, if the
