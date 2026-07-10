@@ -6,6 +6,7 @@ import re
 import sys
 from collections import defaultdict
 from datetime import datetime
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -46,6 +47,24 @@ def call_openai_judge(
     reasoning_effort: Optional[str] = None,
     system_prompt: Optional[str] = None,
 ) -> dict:
+    # Official-judge parity mode: replicate scripts_evaluation/evaluate_run.py
+    # (Qwen3-32B judge) against a remote OpenAI-compatible endpoint — same
+    # single user message, temperature=0.7, top_p=0.8, top_k=20, and
+    # enable_thinking disabled, mirroring its llm.chat(...) call exactly.
+    if os.getenv("QWEN_OFFICIAL_JUDGE") == "1":
+        chat = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            top_p=0.8,
+            max_tokens=max_output_tokens,
+            extra_body={
+                "top_k": 20,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        return SimpleNamespace(output_text=chat.choices[0].message.content or "")
+
     body = {
         "model": model,
         "max_output_tokens": max_output_tokens,
