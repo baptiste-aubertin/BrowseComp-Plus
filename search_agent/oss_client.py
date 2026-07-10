@@ -197,6 +197,14 @@ def run_conversation_with_tools(
                 # (400 "Unknown channel"). Strip to the registered name.
                 name_match = re.match(r"[A-Za-z0-9_]+", item["name"].split("<|")[0])
                 clean_name = name_match.group(0) if name_match else item["name"]
+                # The glued junk is not always marker-delimited (e.g.
+                # "local_knowledge_base_retrievalcommentary",
+                # "local_knowledge_base_retrievaljson") — snap any name that
+                # starts with a registered tool name back to that tool.
+                for known in ("local_knowledge_base_retrieval", "get_document"):
+                    if clean_name != known and clean_name.startswith(known):
+                        clean_name = known
+                        break
                 normalized_output.append(
                     {
                         "type": "function_call",
