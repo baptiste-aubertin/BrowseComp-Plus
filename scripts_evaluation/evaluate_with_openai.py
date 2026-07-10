@@ -33,8 +33,42 @@ def load_ground_truth(jsonl_path: Path) -> Dict[str, Dict[str, str]]:
     return gt
 
 
+# Verbatim copy of the leaderboard judge template from evaluate_run.py.
+# It differs from search_agent.prompts.GRADER_TEMPLATE: the official one
+# instructs the judge to accept string variations and more-precise/verbose
+# answers, so it is measurably more lenient. Used when QWEN_OFFICIAL_JUDGE=1
+# so remote judging is fully leaderboard-comparable.
+GRADER_TEMPLATE_OFFICIAL = """
+Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
+
+[question]: {question}
+
+[response]: {response}
+
+[correct_answer]: {correct_answer}
+
+Your judgement must be in the format and criteria specified below:
+
+extracted_final_answer: The final exact answer extracted from the [response]. 
+
+[correct_answer]: Repeat the [correct_answer] given above.
+
+reasoning: Explain why the extracted_final_answer is correct or incorrect based on [correct_answer], in the context of this [question]. You should judge whether the extracted_final_answer is semantically equivalent to [correct_answer], allowing the extracted_final_answer to be string variations of [correct_answer]. You should also allow the extracted_final_answer to be more precise or verbose than [correct_answer], as long as its additional details are correct. Do not comment on any background to the problem, do not attempt to solve the problem, do not argue for any answer different than [correct_answer], focus only on whether the answers are semantically equivalent.
+
+correct: Answer 'yes' if extracted_final_answer matches the [correct_answer] given above, or is within a small margin of error for numerical problems. Answer 'no' otherwise, i.e. if there if there is any inconsistency, ambiguity, non-equivalency, or if the extracted answer is incorrect.
+
+
+confidence: The extracted confidence score between 0|\%| and 100|\%| from [response]. Put 100 if there is no confidence score available.
+"""
+
+
 def create_judge_prompt(question: str, response: str, correct_answer: str) -> str:
-    return GRADER_TEMPLATE.format(
+    template = (
+        GRADER_TEMPLATE_OFFICIAL
+        if os.getenv("QWEN_OFFICIAL_JUDGE") == "1"
+        else GRADER_TEMPLATE
+    )
+    return template.format(
         question=question, response=response, correct_answer=correct_answer
     )
 
