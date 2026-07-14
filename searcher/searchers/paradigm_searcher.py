@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # cross-encoder) operates on this candidate pool, so a wider request improves
 # the final top-5. 50 was chosen over 100 after an offline eval on 250 labelled
 # pairs showed identical gold-in-top-5 (80.4%) at half the cross-encoder cost.
-PARADIGM_MAX_RESULTS = 50
+PARADIGM_MAX_RESULTS = int(os.getenv("PARADIGM_MAX_RESULTS", "50"))
 
 # Cross-encoder (reranker) modes for /api/v3/search
 # (paradigm-mission-control #3685 / #3745):
