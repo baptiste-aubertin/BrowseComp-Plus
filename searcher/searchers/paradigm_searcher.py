@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 # the final top-5. 50 was chosen over 100 after an offline eval on 250 labelled
 # pairs showed identical gold-in-top-5 (80.4%) at half the cross-encoder cost.
 PARADIGM_MAX_RESULTS = int(os.getenv("PARADIGM_MAX_RESULTS", "50"))
+EXPAND_QUERIES = os.getenv("PARADIGM_EXPAND_QUERIES", "") == "1"
+EXPAND_MODEL = os.getenv("PARADIGM_EXPAND_MODEL", "gpt-oss-120b")
+EXPAND_MODEL_URL = os.getenv("PARADIGM_EXPAND_MODEL_URL", "http://87.120.213.41:8003/v1")
 
 # Cross-encoder (reranker) modes for /api/v3/search
 # (paradigm-mission-control #3685 / #3745):
@@ -115,6 +118,16 @@ class ParadigmSearcher(BaseSearcher):
         # docid (external_id) -> file_id, populated by search results and on-demand lookups.
         self._docid_to_file_id: Dict[str, int] = {}
 
+        self._expand_cache: Dict[str, List[str]] = {}
+        if EXPAND_QUERIES:
+            import openai
+
+            self._expand_client = openai.OpenAI(
+                base_url=EXPAND_MODEL_URL,
+                api_key=os.getenv("LLM_API_KEY", "EMPTY"),
+                timeout=180,
+            )
+
         logger.info(
             "Paradigm searcher ready (base_url=%s workspace_id=%s mode=%s relevance_scoring=%s)",
             self.base_url,
@@ -190,6 +203,71 @@ class ParadigmSearcher(BaseSearcher):
             time.sleep(wait)
 
     def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
+        """Top-k unique docs; optionally via multi-query expansion (RRF merge).
+
+        PARADIGM_EXPAND_QUERIES=1 mirrors the proposed server-side expansion:
+        an LLM generates a keyword variant and a paraphrase, the three queries
+        run concurrently, and the per-query doc rankings are merged with
+        reciprocal-rank fusion (k=60). Offline study on 830 questions: pool
+        ceiling +13.5, evidence@50 +8.8 vs the single query.
+        """
+        if not EXPAND_QUERIES:
+            return self._search_one(query, k)
+        variants = [query] + self._expand_query(query)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(variants)) as ex:
+            rankings = list(ex.map(lambda q: self._search_one(q, PARADIGM_MAX_RESULTS), variants))
+        rrf: Dict[str, float] = {}
+        best_hit: Dict[str, Dict[str, Any]] = {}
+        for ranked in rankings:
+            for i, hit in enumerate(ranked):
+                d = hit["docid"]
+                rrf[d] = rrf.get(d, 0.0) + 1.0 / (60 + i + 1)
+                cur = best_hit.get(d)
+                if cur is None or hit["score"] > cur["score"]:
+                    best_hit[d] = hit
+        merged = sorted(rrf, key=lambda d: rrf[d], reverse=True)[:k]
+        return [{**best_hit[d], "score": round(rrf[d], 6)} for d in merged]
+
+    def _expand_query(self, query: str) -> List[str]:
+        """Two LLM-generated variants (keyword, paraphrase); cached per query."""
+        cached = self._expand_cache.get(query.strip().lower())
+        if cached is not None:
+            return cached
+        prompt = (
+            "Given a search query, produce exactly two alternative search queries for a "
+            "keyword+semantic search engine:\n"
+            "1. KEYWORD: the key entities, names, dates and rare terms only (no filler words).\n"
+            "2. PARAPHRASE: a reformulation using different vocabulary/synonyms that preserves "
+            "the information need.\n\n"
+            'Reply as strict JSON: {"keyword": "...", "paraphrase": "..."}\n\n'
+            f"Search query: {query}"
+        )
+        delay = 1.0
+        for _ in range(6):
+            try:
+                resp = self._expand_client.chat.completions.create(
+                    model=EXPAND_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=2048,
+                )
+                txt = resp.choices[0].message.content
+                d = json.loads(txt[txt.find("{") : txt.rfind("}") + 1])
+                out = [str(d["keyword"]).strip()[:1500], str(d["paraphrase"]).strip()[:1500]]
+                out = [v for v in out if v]
+                self._expand_cache[query.strip().lower()] = out
+                return out
+            except Exception as e:
+                logger.warning("query expansion failed (%s); retrying", str(e)[:80])
+                time.sleep(min(delay, 15))
+                delay *= 2
+        # Expansion is an enhancement — degrade to the plain query, never block search.
+        self._expand_cache[query.strip().lower()] = []
+        return []
+
+    def _search_one(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         # Always pull the API's maximum candidate pool; the cross-encoder scores
         # exactly these max_results candidates (no overfetched tail since #3685).
         # Then dedup by docid (best chunk per doc) and take top-k unique docids.
