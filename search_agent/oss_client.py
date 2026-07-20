@@ -255,7 +255,13 @@ def run_conversation_with_tools(
                     }
                 )
             else:
-                normalized_output.append(item)
+                # Strip output-only fields before replay: OpenAI's Responses
+                # API rejects unknown params on input items (400 "Unknown
+                # parameter: 'input[N].status'"); vLLM tolerates them. Dropping
+                # them is lossless for both backends.
+                normalized_output.append(
+                    {k: v for k, v in item.items() if k != "status"} if isinstance(item, dict) else item
+                )
         response_dict["output"] = normalized_output
 
         # Refresh the latest reasoning text for retrieval augmentation (the
