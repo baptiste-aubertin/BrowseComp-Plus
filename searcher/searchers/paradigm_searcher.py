@@ -267,7 +267,15 @@ class ParadigmSearcher(BaseSearcher):
         self._expand_cache[query.strip().lower()] = []
         return []
 
+    @staticmethod
+    def _sanitize_query(query: str) -> str:
+        """Strip control characters LLMs occasionally emit (GPT-5 produced
+        \x00 inside quoted search strings, which the API rejects with 422
+        "Null characters are not allowed") — a lost search round otherwise."""
+        return "".join(ch for ch in query if ch >= " " or ch in "\n\t").strip()
+
     def _search_one(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
+        query = self._sanitize_query(query)
         # Always pull the API's maximum candidate pool; the cross-encoder scores
         # exactly these max_results candidates (no overfetched tail since #3685).
         # Then dedup by docid (best chunk per doc) and take top-k unique docids.
