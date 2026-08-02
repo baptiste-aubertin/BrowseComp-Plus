@@ -4,7 +4,9 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -27,25 +29,33 @@ from searcher.searchers import SearcherType
 
 class SearchToolHandler:
 
+    # query + "\n\n" + reasoning tail must fit the search API's query bound
+    AUGMENT_QUERY_BUDGET = 4000
+
     def __init__(
         self,
         searcher,
         snippet_max_tokens: int | None = None,
         k: int = 5,
         include_get_document: bool = True,
+        augment_search_with_reasoning: bool = False,
     ):
         self.searcher = searcher
         self.snippet_max_tokens = snippet_max_tokens
         self.k = k
         self.include_get_document = include_get_document
+        self.augment_search_with_reasoning = augment_search_with_reasoning
 
         self.tokenizer = None
         if snippet_max_tokens and snippet_max_tokens > 0:
             self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
-    def execute_tool(self, tool_name: str, arguments: dict):
+    def execute_tool(self, tool_name: str, arguments: dict, reasoning_context: str = ""):
+        # reasoning_context is per-conversation state owned by the caller —
+        # the handler instance is shared across worker threads, so it must
+        # never hold it as an attribute.
         if tool_name == "local_knowledge_base_retrieval":
-            return self._search(arguments["user_query"])
+            return self._search(arguments["user_query"], reasoning_context)
         elif tool_name == "get_document":
             return self._get_document(arguments["docid"])
         else:
@@ -95,8 +105,17 @@ class SearchToolHandler:
 
         return tools
 
-    def _search(self, query: str):
-        candidates = self.searcher.search(query, self.k)
+    def _search(self, query: str, reasoning_context: str = ""):
+        search_text = query
+        if self.augment_search_with_reasoning and reasoning_context:
+            # Query-first concatenation, reasoning tail budgeted to the API
+            # bound — the offline study's winning form (query-first protects
+            # the query core from truncation in LateOn's ~300-token query
+            # window and the cross-encoder prompt).
+            budget = self.AUGMENT_QUERY_BUDGET - len(query) - 2
+            if budget > 0:
+                search_text = (query + "\n\n" + reasoning_context[-budget:]).strip()
+        candidates = self.searcher.search(search_text, self.k)
 
         if self.snippet_max_tokens and self.snippet_max_tokens > 0 and self.tokenizer:
             for cand in candidates:
@@ -148,6 +167,8 @@ def run_conversation_with_tools(
     messages = initial_request["input"]
 
     iteration = 1
+    consecutive_errors = 0
+    latest_reasoning = ""  # per-conversation; fed to search augmentation only
 
     while iteration <= max_iterations:
         try:
@@ -157,13 +178,110 @@ def run_conversation_with_tools(
                 **request,
             )
         except Exception as e:
+            # Transient endpoint failures must not consume the tool-round
+            # budget — retry with backoff, and only give up after a sustained
+            # outage so the trajectory is marked as an infra error, not graded
+            # as an agent failure.
+            consecutive_errors += 1
+            err_s = str(e)
             if verbose:
-                print(f"Error: {e}")
-                rprint(f"Request: {request}")
-            iteration += 1
+                print(f"Error ({consecutive_errors} consecutive): {e}")
+            # Context overflow is deterministic: a get_document on a huge
+            # corpus doc can push the prompt past max_model_len and no retry
+            # can fix it. Halve the largest fetched document in the history
+            # (marked as truncated) and retry — converges in a few halvings,
+            # never touches reasoning items, and only fires on overflow.
+            if "exceeds the max_model_len" in err_s or "reduce prompt" in err_s.lower():
+                longest = None
+                for m in messages:
+                    if (
+                        isinstance(m, dict)
+                        and m.get("type") == "function_call_output"
+                        and isinstance(m.get("output"), str)
+                    ):
+                        if longest is None or len(m["output"]) > len(longest["output"]):
+                            longest = m
+                if longest is not None and len(longest["output"]) > 4000:
+                    longest["output"] = (
+                        longest["output"][: len(longest["output"]) // 2]
+                        + "\n...[truncated: document exceeds the model context window]"
+                    )
+                    if verbose:
+                        print("Context overflow: halved largest tool output and retrying")
+                    continue
+            # Harmony 400s on replayed reasoning items are a server-side vLLM
+            # bug. Never degrade the trajectory by stripping its reasoning —
+            # retry (a healthy replica may serve the next attempt) and, if the
+            # outage is sustained, abort with status "error" so the run
+            # wrapper redoes the whole trajectory from scratch at full
+            # intelligence.
+            if consecutive_errors >= 20:
+                return messages, tool_usage, "error"
+            time.sleep(min(2 ** min(consecutive_errors, 5), 30))
             continue
+        consecutive_errors = 0
 
         response_dict = response.model_dump(mode="python")
+
+        # vLLM Responses-API quirk: once function_call_output items appear in the
+        # input, subsequent tool calls can come back typed as `mcp_call`
+        # (server_label="functions") instead of `function_call`. Normalize them so
+        # the loop below recognizes and executes them — otherwise the trajectory
+        # silently terminates after the first search round.
+        normalized_output = []
+        for item in response_dict["output"]:
+            if item.get("type") in ("mcp_call", "function_call") and item.get("name"):
+                # vLLM's harmony parser sometimes leaks channel markers and
+                # trailing junk into the tool name (e.g.
+                # "search<|channel|>commentary", "search,json"). A corrupted
+                # name fails tool dispatch and poisons the replayed history
+                # (400 "Unknown channel"). Strip to the registered name.
+                name_match = re.match(r"[A-Za-z0-9_]+", item["name"].split("<|")[0])
+                clean_name = name_match.group(0) if name_match else item["name"]
+                # The glued junk is not always marker-delimited (e.g.
+                # "local_knowledge_base_retrievalcommentary",
+                # "local_knowledge_base_retrievaljson") — snap any name that
+                # starts with a registered tool name back to that tool.
+                for known in ("local_knowledge_base_retrieval", "get_document"):
+                    if clean_name != known and clean_name.startswith(known):
+                        clean_name = known
+                        break
+                normalized_output.append(
+                    {
+                        "type": "function_call",
+                        "call_id": item.get("call_id") or item.get("id"),
+                        "name": clean_name,
+                        "arguments": item.get("arguments") or "{}",
+                    }
+                )
+            else:
+                # Strip output-only fields before replay: OpenAI's Responses
+                # API rejects unknown params on input items (400 "Unknown
+                # parameter: 'input[N].status'"); vLLM tolerates them. Dropping
+                # them is lossless for both backends.
+                normalized_output.append(
+                    {k: v for k, v in item.items() if k != "status"} if isinstance(item, dict) else item
+                )
+        response_dict["output"] = normalized_output
+
+        # Refresh the latest reasoning text for retrieval augmentation (the
+        # tool handler decides whether to use it). Mirrors the extraction in
+        # _persist_response.
+        for item in response_dict["output"]:
+            if item.get("type") != "reasoning":
+                continue
+            summary = item.get("summary")
+            if isinstance(summary, list) and summary:
+                parts = [str(p) for p in summary]
+            else:
+                parts = [
+                    str(p.get("text", "")).strip()
+                    for p in item.get("content", []) or []
+                    if isinstance(p, dict) and p.get("type") in {"reasoning_text", "output_text", "text"}
+                ]
+            text = " ".join(t for t in parts if t).strip()
+            if text:
+                latest_reasoning = text
 
         messages.extend(response_dict["output"])
 
@@ -185,8 +303,13 @@ def run_conversation_with_tools(
 
         for tool_call in function_calls:
             try:
-                arguments = json.loads(tool_call["arguments"])
-                result = tool_handler.execute_tool(tool_call["name"], arguments)
+                # strict=False tolerates raw control characters (newlines/tabs)
+                # inside quoted strings — gpt-oss occasionally emits them in
+                # tool arguments and the search would otherwise be wasted.
+                arguments = json.loads(tool_call["arguments"], strict=False)
+                result = tool_handler.execute_tool(
+                    tool_call["name"], arguments, reasoning_context=latest_reasoning
+                )
                 tool_usage[tool_call["name"]] = tool_usage.get(tool_call["name"], 0) + 1
 
                 new_messages.append(
@@ -503,6 +626,15 @@ def main():
         action="store_true",
         help="Also register the get_document tool",
     )
+    parser.add_argument(
+        "--augment-search-with-reasoning",
+        action="store_true",
+        help=(
+            "Append the model's latest reasoning trace (query-first, budgeted to the "
+            "search API's 4000-char bound) to the text sent to the retriever. The "
+            "model's own tool arguments and replayed history are unchanged."
+        ),
+    )
 
     temp_args, _ = parser.parse_known_args()
     searcher_class = SearcherType.get_searcher_class(temp_args.searcher_type)
@@ -518,7 +650,9 @@ def main():
 
     client = openai.OpenAI(
         base_url=args.model_url,
-        api_key="EMPTY",
+        # Auth-enabled endpoints (e.g. LightOn's gpt-oss deployment) need a real
+        # bearer token; plain vLLM ignores it, so "EMPTY" stays the default.
+        api_key=os.getenv("LLM_API_KEY", "EMPTY"),
     )
 
     searcher = searcher_class(args)
@@ -528,6 +662,7 @@ def main():
         snippet_max_tokens=args.snippet_max_tokens,
         k=args.k,
         include_get_document=args.get_document,
+        augment_search_with_reasoning=args.augment_search_with_reasoning,
     )
 
     if isinstance(args.query, str):

@@ -1,5 +1,6 @@
 """LightOn Paradigm Console searcher: POST /api/v3/search + GET /api/v3/files/{id}."""
 
+import json
 import logging
 import os
 import time
@@ -17,7 +18,15 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 logger = logging.getLogger(__name__)
 
-PARADIGM_MAX_RESULTS = 50
+# Chunks requested per /api/v3/search call. Larger than the k=5 docs handed to
+# the LLM: the engine's internal fusion (dense + BM25 + ColBERT rerank +
+# cross-encoder) operates on this candidate pool, so a wider request improves
+# the final top-5. 50 was chosen over 100 after an offline eval on 250 labelled
+# pairs showed identical gold-in-top-5 (80.4%) at half the cross-encoder cost.
+PARADIGM_MAX_RESULTS = int(os.getenv("PARADIGM_MAX_RESULTS", "50"))
+EXPAND_QUERIES = os.getenv("PARADIGM_EXPAND_QUERIES", "") == "1"
+EXPAND_MODEL = os.getenv("PARADIGM_EXPAND_MODEL", "gpt-oss-120b")
+EXPAND_MODEL_URL = os.getenv("PARADIGM_EXPAND_MODEL_URL", "http://87.120.213.41:8003/v1")
 
 # Cross-encoder (reranker) modes for /api/v3/search
 # (paradigm-mission-control #3685 / #3745):
@@ -75,6 +84,12 @@ class ParadigmSearcher(BaseSearcher):
             ),
         )
         parser.add_argument(
+            "--corpus-path",
+            default=os.getenv("BROWSECOMP_CORPUS_PATH", "data/browsecomp_plus_corpus.jsonl"),
+            help="Local corpus JSONL with FULL document texts; get_document serves from here "
+                 "(Paradigm only stores the 512-token ingestion window).",
+        )
+        parser.add_argument(
             "--request-timeout",
             type=float,
             default=120.0,
@@ -94,12 +109,24 @@ class ParadigmSearcher(BaseSearcher):
         self.mode = args.mode
         self.relevance_scoring = args.relevance_scoring
         self.timeout = args.request_timeout
+        self.corpus_path = args.corpus_path
+        self._corpus_index = None
 
         self.session = requests.Session()
         self.session.headers["X-Api-Key"] = args.api_key
 
         # docid (external_id) -> file_id, populated by search results and on-demand lookups.
         self._docid_to_file_id: Dict[str, int] = {}
+
+        self._expand_cache: Dict[str, List[str]] = {}
+        if EXPAND_QUERIES:
+            import openai
+
+            self._expand_client = openai.OpenAI(
+                base_url=EXPAND_MODEL_URL,
+                api_key=os.getenv("LLM_API_KEY", "EMPTY"),
+                timeout=180,
+            )
 
         logger.info(
             "Paradigm searcher ready (base_url=%s workspace_id=%s mode=%s relevance_scoring=%s)",
@@ -176,6 +203,79 @@ class ParadigmSearcher(BaseSearcher):
             time.sleep(wait)
 
     def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
+        """Top-k unique docs; optionally via multi-query expansion (RRF merge).
+
+        PARADIGM_EXPAND_QUERIES=1 mirrors the proposed server-side expansion:
+        an LLM generates a keyword variant and a paraphrase, the three queries
+        run concurrently, and the per-query doc rankings are merged with
+        reciprocal-rank fusion (k=60). Offline study on 830 questions: pool
+        ceiling +13.5, evidence@50 +8.8 vs the single query.
+        """
+        if not EXPAND_QUERIES:
+            return self._search_one(query, k)
+        variants = [query] + self._expand_query(query)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(variants)) as ex:
+            rankings = list(ex.map(lambda q: self._search_one(q, PARADIGM_MAX_RESULTS), variants))
+        rrf: Dict[str, float] = {}
+        best_hit: Dict[str, Dict[str, Any]] = {}
+        for ranked in rankings:
+            for i, hit in enumerate(ranked):
+                d = hit["docid"]
+                rrf[d] = rrf.get(d, 0.0) + 1.0 / (60 + i + 1)
+                cur = best_hit.get(d)
+                if cur is None or hit["score"] > cur["score"]:
+                    best_hit[d] = hit
+        merged = sorted(rrf, key=lambda d: rrf[d], reverse=True)[:k]
+        return [{**best_hit[d], "score": round(rrf[d], 6)} for d in merged]
+
+    def _expand_query(self, query: str) -> List[str]:
+        """Two LLM-generated variants (keyword, paraphrase); cached per query."""
+        cached = self._expand_cache.get(query.strip().lower())
+        if cached is not None:
+            return cached
+        prompt = (
+            "Given a search query, produce exactly two alternative search queries for a "
+            "keyword+semantic search engine:\n"
+            "1. KEYWORD: the key entities, names, dates and rare terms only (no filler words).\n"
+            "2. PARAPHRASE: a reformulation using different vocabulary/synonyms that preserves "
+            "the information need.\n\n"
+            'Reply as strict JSON: {"keyword": "...", "paraphrase": "..."}\n\n'
+            f"Search query: {query}"
+        )
+        delay = 1.0
+        for _ in range(6):
+            try:
+                resp = self._expand_client.chat.completions.create(
+                    model=EXPAND_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=2048,
+                )
+                txt = resp.choices[0].message.content
+                d = json.loads(txt[txt.find("{") : txt.rfind("}") + 1])
+                out = [str(d["keyword"]).strip()[:1500], str(d["paraphrase"]).strip()[:1500]]
+                out = [v for v in out if v]
+                self._expand_cache[query.strip().lower()] = out
+                return out
+            except Exception as e:
+                logger.warning("query expansion failed (%s); retrying", str(e)[:80])
+                time.sleep(min(delay, 15))
+                delay *= 2
+        # Expansion is an enhancement — degrade to the plain query, never block search.
+        self._expand_cache[query.strip().lower()] = []
+        return []
+
+    @staticmethod
+    def _sanitize_query(query: str) -> str:
+        """Strip control characters LLMs occasionally emit (GPT-5 produced
+        \x00 inside quoted search strings, which the API rejects with 422
+        "Null characters are not allowed") — a lost search round otherwise."""
+        return "".join(ch for ch in query if ch >= " " or ch in "\n\t").strip()
+
+    def _search_one(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
+        query = self._sanitize_query(query)
         # Always pull the API's maximum candidate pool; the cross-encoder scores
         # exactly these max_results candidates (no overfetched tail since #3685).
         # Then dedup by docid (best chunk per doc) and take top-k unique docids.
@@ -187,8 +287,12 @@ class ParadigmSearcher(BaseSearcher):
             "query": query,
             "max_results": PARADIGM_MAX_RESULTS,
             "mode": self.mode,
-            "relevance_scoring": self.relevance_scoring,
         }
+        # Newer API versions only accept explicit non-default modes in the
+        # request (choices: none / scoring_only); scoring_and_filtering is the
+        # server default and must be expressed by omitting the field.
+        if self.relevance_scoring != "scoring_and_filtering":
+            payload["relevance_scoring"] = self.relevance_scoring
         if self.workspace_id is not None:
             payload["workspace_id"] = [self.workspace_id]
 
@@ -261,24 +365,35 @@ class ParadigmSearcher(BaseSearcher):
         self._docid_to_file_id[docid] = file_id
         return file_id
 
-    def get_document(self, docid: str) -> Optional[Dict[str, Any]]:
-        file_id = self._resolve_file_id(docid)
-        if file_id is None:
-            return None
+    def _corpus_offsets(self) -> Dict[str, int]:
+        """Lazy byte-offset index over the local corpus JSONL (docid -> offset).
 
-        r = self._request(
-            "GET",
-            f"{self.base_url}/api/v3/files/{file_id}",
-            params={"include_content": "true"},
-        )
-        if r.status_code == 404:
+        Paradigm stores only the 512-token ingestion window per document;
+        ``get_document`` must return the *full* original text, exactly like the
+        PyLate searcher does from the HF corpus. A seek index keeps memory flat
+        instead of holding the whole ~3 GB corpus in RAM.
+        """
+        if getattr(self, "_corpus_index", None) is None:
+            index: Dict[str, int] = {}
+            offset = 0
+            with open(self.corpus_path, "rb") as f:
+                for line in f:
+                    # docid is the first key of every corpus row — cheap parse.
+                    key = line[: line.find(b",")].split(b":", 1)[-1].strip(b' "')
+                    index[key.decode()] = offset
+                    offset += len(line)
+            logger.info("Indexed %d corpus documents from %s", len(index), self.corpus_path)
+            self._corpus_index = index
+        return self._corpus_index
+
+    def get_document(self, docid: str) -> Optional[Dict[str, Any]]:
+        offset = self._corpus_offsets().get(str(docid))
+        if offset is None:
             return None
-        r.raise_for_status()
-        body = r.json()
-        text = body.get("content")
-        if text is None:
-            return None
-        return {"docid": docid, "text": text}
+        with open(self.corpus_path, "rb") as f:
+            f.seek(offset)
+            row = json.loads(f.readline())
+        return {"docid": str(row["docid"]), "text": row.get("text", "")}
 
     @property
     def search_type(self) -> str:
@@ -292,4 +407,4 @@ class ParadigmSearcher(BaseSearcher):
         )
 
     def get_document_description(self) -> str:
-        return "Retrieve the full text content of a document by its docid from Paradigm."
+        return "Retrieve a full document by its docid."

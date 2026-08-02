@@ -7,6 +7,12 @@ Three actions (combinable):
 
 Docids are matched via external_metadata.external_id. Reruns are idempotent — only
 docids that need work get touched.
+
+Documents are truncated before upload to mirror the upstream benchmark's 512-token
+document window (build_pylate_index.py --document-length 512), counted with the
+lightonai/DenseOn-multilingual tokenizer (the Paradigm embedder): each doc is cut so
+that <bos> <text> <eos> fits in --document-length tokens, i.e. document_length - 2
+content tokens (510 for the default 512).
 """
 
 import argparse
@@ -19,12 +25,15 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
+from transformers import PreTrainedTokenizerFast
 
 load_dotenv()
 
 BASE_URL = os.environ["PARADIGM_BASE_URL"].rstrip("/")
 API_KEY = os.environ["PARADIGM_API_KEY"]
 WORKSPACE_ID = int(os.environ["PARADIGM_WORKSPACE_ID"])
+
+TOKENIZER_NAME = "lightonai/DenseOn-multilingual"
 
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 FAIL_STATUSES = {"parsing_failed", "embedding_failed", "fail"}
@@ -62,7 +71,15 @@ def list_workspace(
     page_num = 0
     total = None
     while True:
-        r = session.get(url, params=params, timeout=60)
+        for attempt in range(8):
+            r = session.get(url, params=params, timeout=60)
+            if r.status_code in RETRYABLE_STATUS:
+                # Honor Retry-After on 429/5xx — the files list is throttled
+                # per-minute, so a long walk must pace itself instead of dying.
+                wait = r.headers.get("Retry-After")
+                time.sleep(int(wait) if wait and wait.isdigit() else min(2**attempt * 2, 60))
+                continue
+            break
         r.raise_for_status()
         body = r.json()
         results = body.get("results", [])
@@ -105,18 +122,24 @@ def find_file_by_external_id(
     return best
 
 
-def upload_doc(session: requests.Session, docid: str, text: str, url: str) -> dict:
-    """POST /api/v3/files. WAF fallback on 403; exponential backoff on retryable 5xx."""
+def upload_doc(session: requests.Session, docid: str, text: str, url: str, filename_nonce: str = "") -> dict:
+    """POST /api/v3/files. WAF fallback on 403; exponential backoff on retryable 5xx.
+
+    filename_nonce: appended to the stored filename (never to external_id). Used on
+    delete + re-upload so the new blob lands on a fresh storage path — the async
+    hard-delete of the old row otherwise races the re-upload on the same path and
+    removes the new file (parse then dies with FileNotFoundError).
+    """
     payload = text.encode("utf-8")
     # WAF fallback variants: tried in order on 403. The Paradigm parser sniffs
     # content, so swapping Content-Type / extension is harmless for ingestion
     # but can route past a content-type-scoped WAF rule.
     variants = [("txt", "text/plain"), ("bin", "application/octet-stream"), ("md", "text/markdown")]
     idx = 0
-    files = {"file": (f"{docid}.{variants[0][0]}", payload, variants[0][1])}
+    files = {"file": (f"{docid}{filename_nonce}.{variants[0][0]}", payload, variants[0][1])}
     data = {
         "workspace_id": str(WORKSPACE_ID),
-        "filename": f"{docid}.txt",
+        "filename": f"{docid}{filename_nonce}.txt",
         "title": (url or f"doc-{docid}")[:255],
         "external_metadata": json.dumps(
             {"external_id": str(docid), "additional_metadata": {"url": url} if url else {}}
@@ -131,7 +154,7 @@ def upload_doc(session: requests.Session, docid: str, text: str, url: str) -> di
             if r.status_code == 403 and idx + 1 < len(variants):
                 idx += 1
                 ext, ctype = variants[idx]
-                files = {"file": (f"{docid}.{ext}", payload, ctype)}
+                files = {"file": (f"{docid}{filename_nonce}.{ext}", payload, ctype)}
                 continue
             if r.status_code in RETRYABLE_STATUS:
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
@@ -168,16 +191,51 @@ def redo_failed(session: requests.Session, docid: str, file_row: dict, corpus: d
     if not ok:
         return {"docid": docid, "ok": False, "error": f"delete: {err}"}
     text, url = corpus[docid]
-    return upload_doc(session, docid, text, url)
+    # Fresh storage path per retry attempt — see upload_doc(filename_nonce=...).
+    return upload_doc(session, docid, text, url, filename_nonce=f"-r{int(time.time()) % 100000}")
 
 
-def load_corpus(path: Path) -> dict[str, tuple[str, str]]:
-    corpus: dict[str, tuple[str, str]] = {}
+def truncate_texts(texts: list[str], document_length: int, batch_size: int = 256) -> list[str]:
+    """Truncate each text so the embedder input <bos> <text> <eos> fits in
+    document_length tokens, i.e. document_length - num_special_tokens_to_add()
+    content tokens. Texts under the limit are kept verbatim rather than
+    round-tripped through the tokenizer."""
+    # The repo's tokenizer_config declares the transformers-v5 TokenizersBackend
+    # class, which AutoTokenizer in transformers 4.x can't resolve; loading through
+    # PreTrainedTokenizerFast reads tokenizer.json directly.
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(TOKENIZER_NAME)
+    max_tokens = document_length - tokenizer.num_special_tokens_to_add(False)
+    out: list[str] = []
+    n_truncated = 0
+    for i in tqdm(range(0, len(texts), batch_size), desc="truncate", unit="batch"):
+        batch = texts[i : i + batch_size]
+        encoded = tokenizer(batch, add_special_tokens=False)["input_ids"]
+        for text, tokens in zip(batch, encoded):
+            if len(tokens) > max_tokens:
+                out.append(tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True))
+                n_truncated += 1
+            else:
+                out.append(text)
+    print(
+        f"  truncated {n_truncated:,}/{len(texts):,} docs to {max_tokens} content tokens "
+        f"(document_length={document_length})"
+    )
+    return out
+
+
+def load_corpus(path: Path, document_length: int = 512) -> dict[str, tuple[str, str]]:
+    docids: list[str] = []
+    texts: list[str] = []
+    urls: list[str] = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             row = json.loads(line)
-            corpus[str(row["docid"])] = (row.get("text", ""), row.get("url", "") or "")
-    return corpus
+            docids.append(str(row["docid"]))
+            texts.append(row.get("text", ""))
+            urls.append(row.get("url", "") or "")
+    if document_length and document_length > 0:
+        texts = truncate_texts(texts, document_length)
+    return {d: (t, u) for d, t, u in zip(docids, texts, urls)}
 
 
 def parse_retry_ids(docids_csv: str, corpus_docids: set[str]) -> set[str]:
@@ -197,6 +255,12 @@ def main() -> None:
     )
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument(
+        "--document-length", type=int, default=512,
+        help="Document window to replicate (same flag as the upstream "
+             f"build_pylate_index.py): docs are cut to document_length - 2 content tokens "
+             f"of the {TOKENIZER_NAME} tokenizer before upload. 0 disables.",
+    )
+    parser.add_argument(
         "--docids", type=str, default=None,
         help="Comma-separated docids to retry. Looked up per-docid; no full workspace listing.",
     )
@@ -215,7 +279,7 @@ def main() -> None:
         parser.error("specify at least one of --docids, --verify, --check-failed")
 
     s = _session()
-    corpus = load_corpus(args.input)
+    corpus = load_corpus(args.input, args.document_length)
     corpus_docids = set(corpus)
     print(f"corpus: {len(corpus):,} docids from {args.input}")
 
